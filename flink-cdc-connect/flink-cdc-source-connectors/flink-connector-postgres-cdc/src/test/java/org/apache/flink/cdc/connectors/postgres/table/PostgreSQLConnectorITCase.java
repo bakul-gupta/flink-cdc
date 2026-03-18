@@ -33,14 +33,11 @@ import org.apache.flink.util.CloseableIterator;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.containers.output.Slf4jLogConsumer;
-import org.testcontainers.lifecycle.Startables;
-import org.testcontainers.utility.DockerImageName;
 
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -50,9 +47,6 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.ExecutionException;
-import java.util.stream.Stream;
-
-import static org.testcontainers.containers.PostgreSQLContainer.POSTGRESQL_PORT;
 
 /** Integration tests for PostgreSQL Table source. */
 class PostgreSQLConnectorITCase extends PostgresTestBase {
@@ -63,42 +57,18 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
             StreamTableEnvironment.create(
                     env, EnvironmentSettings.newInstance().inStreamingMode().build());
 
-    /** Use postgis plugin to test the GIS type. */
-    protected static final DockerImageName POSTGIS_IMAGE =
-            DockerImageName.parse("postgis/postgis:14-3.5").asCompatibleSubstituteFor("postgres");
-
-    public static final PostgreSQLContainer<?> POSTGIS_CONTAINER =
-            new PostgreSQLContainer<>(POSTGIS_IMAGE)
-                    .withDatabaseName(DEFAULT_DB)
-                    .withUsername("postgres")
-                    .withPassword("postgres")
-                    .withLogConsumer(new Slf4jLogConsumer(LOG))
-                    .withCommand(
-                            "postgres",
-                            "-c",
-                            // default
-                            "fsync=off",
-                            "-c",
-                            "max_replication_slots=20",
-                            "-c",
-                            "wal_level=logical");
-
     @RegisterExtension
     public static StaticExternalResourceProxy<LegacyRowResource> usesLegacyRows =
             new StaticExternalResourceProxy<>(LegacyRowResource.INSTANCE);
 
     @BeforeAll
     static void startContainers() throws Exception {
-        LOG.info("Starting containers...");
-        Startables.deepStart(Stream.of(POSTGRES_CONTAINER, POSTGIS_CONTAINER)).join();
-        LOG.info("Containers are started.");
+        LOG.info("Using external YugabyteDB at {}:{}", TEST_HOST, TEST_PORT);
     }
 
     @AfterAll
     static void stopContainers() {
-        LOG.info("Stopping containers...");
-        POSTGIS_CONTAINER.stop();
-        LOG.info("Containers are stopped.");
+        LOG.info("Using external database, no containers to stop.");
     }
 
     void setup(boolean parallelismSnapshot) {
@@ -113,7 +83,7 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
+    @ValueSource(booleans = {false})
     void testConsumingAllEvents(boolean parallelismSnapshot)
             throws SQLException, ExecutionException, InterruptedException {
         setup(parallelismSnapshot);
@@ -138,11 +108,11 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 + " 'decoding.plugin.name' = 'pgoutput', "
                                 + " 'slot.name' = '%s'"
                                 + ")",
-                        POSTGRES_CONTAINER.getHost(),
-                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
-                        POSTGRES_CONTAINER.getUsername(),
-                        POSTGRES_CONTAINER.getPassword(),
-                        POSTGRES_CONTAINER.getDatabaseName(),
+                        TEST_HOST,
+                        TEST_PORT,
+                        TEST_USER,
+                        TEST_PASSWORD,
+                        DEFAULT_DB,
                         "inventory",
                         "products",
                         parallelismSnapshot,
@@ -178,9 +148,9 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                     "UPDATE inventory.products SET description='18oz carpenter hammer' WHERE id=106;");
             statement.execute("UPDATE inventory.products SET weight='5.1' WHERE id=107;");
             statement.execute(
-                    "INSERT INTO inventory.products VALUES (default,'jacket','water resistent white wind breaker',0.2);"); // 110
+                    "INSERT INTO inventory.products VALUES (110,'jacket','water resistent white wind breaker',0.2);");
             statement.execute(
-                    "INSERT INTO inventory.products VALUES (default,'scooter','Big 2-wheel scooter ',5.18);");
+                    "INSERT INTO inventory.products VALUES (111,'scooter','Big 2-wheel scooter ',5.18);");
             statement.execute(
                     "UPDATE inventory.products SET description='new water resistent white wind breaker', weight='0.5' WHERE id=110;");
             statement.execute("UPDATE inventory.products SET weight='5.17' WHERE id=111;");
@@ -232,8 +202,9 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
         result.getJobClient().get().cancel().get();
     }
 
+    @Disabled("YugabyteDB does not support publish_via_partition_root for partitioned tables")
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
+    @ValueSource(booleans = {false})
     void testConsumingAllEventsForPartitionedTable(boolean parallelismSnapshot)
             throws SQLException, ExecutionException, InterruptedException {
         setup(parallelismSnapshot);
@@ -276,11 +247,11 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 + " 'debezium.publication.name'  = '%s',"
                                 + " 'slot.name' = '%s'"
                                 + ")",
-                        POSTGRES_CONTAINER.getHost(),
-                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
-                        POSTGRES_CONTAINER.getUsername(),
-                        POSTGRES_CONTAINER.getPassword(),
-                        POSTGRES_CONTAINER.getDatabaseName(),
+                        TEST_HOST,
+                        TEST_PORT,
+                        TEST_USER,
+                        TEST_PASSWORD,
+                        DEFAULT_DB,
                         "inventory_partitioned",
                         "products",
                         parallelismSnapshot,
@@ -316,13 +287,13 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
         try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
                 Statement statement = connection.createStatement()) {
             statement.execute(
-                    "INSERT INTO inventory_partitioned.products VALUES (default,'jacket','water resistent white wind breaker',0.2, 'us');"); // 110
+                    "INSERT INTO inventory_partitioned.products VALUES (110,'jacket','water resistent white wind breaker',0.2, 'us');");
             statement.execute(
-                    "INSERT INTO inventory_partitioned.products VALUES (default,'scooter','Big 2-wheel scooter ',5.18, 'uk');");
+                    "INSERT INTO inventory_partitioned.products VALUES (111,'scooter','Big 2-wheel scooter ',5.18, 'uk');");
             statement.execute(
                     "CREATE TABLE inventory_partitioned.products_china PARTITION OF inventory_partitioned.products FOR VALUES IN ('china');");
             statement.execute(
-                    "INSERT INTO inventory_partitioned.products VALUES (default,'bike','Big 2-wheel bycicle ',6.18, 'china');");
+                    "INSERT INTO inventory_partitioned.products VALUES (112,'bike','Big 2-wheel bycicle ',6.18, 'china');");
         }
 
         waitForSinkSize("sink", 11);
@@ -350,6 +321,7 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
         result.getJobClient().get().cancel().get();
     }
 
+    @Disabled("YugabyteDB does not support incremental snapshot")
     @ParameterizedTest
     @ValueSource(booleans = {true})
     void testStartupFromLatestOffset(boolean parallelismSnapshot) throws Exception {
@@ -377,11 +349,11 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 + " 'slot.name' = '%s',"
                                 + " 'scan.startup.mode' = 'latest-offset'"
                                 + ")",
-                        POSTGRES_CONTAINER.getHost(),
-                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
-                        POSTGRES_CONTAINER.getUsername(),
-                        POSTGRES_CONTAINER.getPassword(),
-                        POSTGRES_CONTAINER.getDatabaseName(),
+                        TEST_HOST,
+                        TEST_PORT,
+                        TEST_USER,
+                        TEST_PASSWORD,
+                        DEFAULT_DB,
                         "inventory",
                         "products",
                         parallelismSnapshot,
@@ -424,6 +396,7 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
         result.getJobClient().get().cancel().get();
     }
 
+    @Disabled("YugabyteDB does not support incremental snapshot")
     @Test
     public void testStartupFromCommittedOffset() throws Exception {
         setup(true);
@@ -486,11 +459,11 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 + " 'scan.lsn-commit.checkpoints-num-delay' = '0',"
                                 + " 'scan.startup.mode' = 'committed-offset'"
                                 + ")",
-                        POSTGRES_CONTAINER.getHost(),
-                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
-                        POSTGRES_CONTAINER.getUsername(),
-                        POSTGRES_CONTAINER.getPassword(),
-                        POSTGRES_CONTAINER.getDatabaseName(),
+                        TEST_HOST,
+                        TEST_PORT,
+                        TEST_USER,
+                        TEST_PASSWORD,
+                        DEFAULT_DB,
                         "inventory",
                         "products",
                         slotName,
@@ -518,7 +491,7 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
+    @ValueSource(booleans = {false})
     void testExceptionForReplicaIdentity(boolean parallelismSnapshot) throws Exception {
         setup(parallelismSnapshot);
         initializePostgresTable(POSTGRES_CONTAINER, "replica_identity");
@@ -542,11 +515,11 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 + " 'decoding.plugin.name' = 'pgoutput', "
                                 + " 'slot.name' = '%s'"
                                 + ")",
-                        POSTGRES_CONTAINER.getHost(),
-                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
-                        POSTGRES_CONTAINER.getUsername(),
-                        POSTGRES_CONTAINER.getPassword(),
-                        POSTGRES_CONTAINER.getDatabaseName(),
+                        TEST_HOST,
+                        TEST_PORT,
+                        TEST_USER,
+                        TEST_PASSWORD,
+                        DEFAULT_DB,
                         "inventory",
                         "products",
                         parallelismSnapshot,
@@ -596,11 +569,12 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 + "please check the Postgres table has been set REPLICA IDENTITY to FULL level.");
     }
 
+    @Disabled("YugabyteDB does not have PostGIS extension")
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
+    @ValueSource(booleans = {false})
     void testAllTypes(boolean parallelismSnapshot) throws Throwable {
         setup(parallelismSnapshot);
-        initializePostgresTable(POSTGIS_CONTAINER, "column_type_test");
+        initializePostgresTable(POSTGRES_CONTAINER, "column_type_test");
 
         String sourceDDL =
                 String.format(
@@ -639,11 +613,11 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 + " 'decoding.plugin.name' = 'pgoutput', "
                                 + " 'slot.name' = '%s'"
                                 + ")",
-                        POSTGIS_CONTAINER.getHost(),
-                        POSTGIS_CONTAINER.getMappedPort(POSTGRESQL_PORT),
-                        POSTGIS_CONTAINER.getUsername(),
-                        POSTGIS_CONTAINER.getPassword(),
-                        POSTGIS_CONTAINER.getDatabaseName(),
+                        TEST_HOST,
+                        TEST_PORT,
+                        TEST_USER,
+                        TEST_PASSWORD,
+                        DEFAULT_DB,
                         "inventory",
                         "full_types",
                         parallelismSnapshot,
@@ -687,7 +661,7 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
         Thread.sleep(5000);
 
         // generate WAL
-        try (Connection connection = getJdbcConnection(POSTGIS_CONTAINER);
+        try (Connection connection = getJdbcConnection(POSTGRES_CONTAINER);
                 Statement statement = connection.createStatement()) {
             statement.execute("UPDATE inventory.full_types SET small_c=0 WHERE id=1;");
         }
@@ -706,7 +680,7 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
+    @ValueSource(booleans = {false})
     void testMetadataColumns(boolean parallelismSnapshot) throws Throwable {
         setup(parallelismSnapshot);
         initializePostgresTable(POSTGRES_CONTAINER, "inventory");
@@ -735,11 +709,11 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 + " 'decoding.plugin.name' = 'pgoutput', "
                                 + " 'slot.name' = '%s'"
                                 + ")",
-                        POSTGRES_CONTAINER.getHost(),
-                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
-                        POSTGRES_CONTAINER.getUsername(),
-                        POSTGRES_CONTAINER.getPassword(),
-                        POSTGRES_CONTAINER.getDatabaseName(),
+                        TEST_HOST,
+                        TEST_PORT,
+                        TEST_USER,
+                        TEST_PASSWORD,
+                        DEFAULT_DB,
                         "inventory",
                         "products",
                         parallelismSnapshot,
@@ -779,9 +753,9 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                     "UPDATE inventory.products SET description='18oz carpenter hammer' WHERE id=106;");
             statement.execute("UPDATE inventory.products SET weight='5.1' WHERE id=107;");
             statement.execute(
-                    "INSERT INTO inventory.products VALUES (default,'jacket','water resistent white wind breaker',0.2);"); // 110
+                    "INSERT INTO inventory.products VALUES (110,'jacket','water resistent white wind breaker',0.2);");
             statement.execute(
-                    "INSERT INTO inventory.products VALUES (default,'scooter','Big 2-wheel scooter ',5.18);");
+                    "INSERT INTO inventory.products VALUES (111,'scooter','Big 2-wheel scooter ',5.18);");
             statement.execute(
                     "UPDATE inventory.products SET description='new water resistent white wind breaker', weight='0.5' WHERE id=110;");
             statement.execute("UPDATE inventory.products SET weight='5.17' WHERE id=111;");
@@ -790,7 +764,7 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
 
         // waiting for change events finished.
         waitForSinkSize("sink", 16);
-        String databaseName = POSTGRES_CONTAINER.getDatabaseName();
+        String databaseName = DEFAULT_DB;
 
         List<String> expected =
                 Arrays.asList(
@@ -848,7 +822,7 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
+    @ValueSource(booleans = {false})
     void testUpsertMode(boolean parallelismSnapshot) throws Exception {
         setup(parallelismSnapshot);
         initializePostgresTable(POSTGRES_CONTAINER, "replica_identity");
@@ -874,11 +848,11 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 + " 'decoding.plugin.name' = 'pgoutput', "
                                 + " 'changelog-mode' = '%s'"
                                 + ")",
-                        POSTGRES_CONTAINER.getHost(),
-                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
-                        POSTGRES_CONTAINER.getUsername(),
-                        POSTGRES_CONTAINER.getPassword(),
-                        POSTGRES_CONTAINER.getDatabaseName(),
+                        TEST_HOST,
+                        TEST_PORT,
+                        TEST_USER,
+                        TEST_PASSWORD,
+                        DEFAULT_DB,
                         "inventory",
                         "products",
                         getSlotName(),
@@ -914,9 +888,9 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                     "UPDATE inventory.products SET description='18oz carpenter hammer' WHERE id=106;");
             statement.execute("UPDATE inventory.products SET weight='5.1' WHERE id=107;");
             statement.execute(
-                    "INSERT INTO inventory.products VALUES (default,'jacket','water resistent white wind breaker',0.2);"); // 110
+                    "INSERT INTO inventory.products VALUES (110,'jacket','water resistent white wind breaker',0.2);");
             statement.execute(
-                    "INSERT INTO inventory.products VALUES (default,'scooter','Big 2-wheel scooter ',5.18);");
+                    "INSERT INTO inventory.products VALUES (111,'scooter','Big 2-wheel scooter ',5.18);");
             statement.execute(
                     "UPDATE inventory.products SET description='new water resistent white wind breaker', weight='0.5' WHERE id=110;");
             statement.execute("UPDATE inventory.products SET weight='5.17' WHERE id=111;");
@@ -969,7 +943,7 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
+    @ValueSource(booleans = {false})
     void testUniqueIndexIncludingFunction(boolean parallelismSnapshot) throws Exception {
         setup(parallelismSnapshot);
         // Clear the influence of usesLegacyRows which set USE_LEGACY_TO_STRING = true.
@@ -1002,11 +976,11 @@ class PostgreSQLConnectorITCase extends PostgresTestBase {
                                 + " 'decoding.plugin.name' = 'pgoutput', "
                                 + " 'slot.name' = '%s'"
                                 + ")",
-                        POSTGRES_CONTAINER.getHost(),
-                        POSTGRES_CONTAINER.getMappedPort(POSTGRESQL_PORT),
-                        POSTGRES_CONTAINER.getUsername(),
-                        POSTGRES_CONTAINER.getPassword(),
-                        POSTGRES_CONTAINER.getDatabaseName(),
+                        TEST_HOST,
+                        TEST_PORT,
+                        TEST_USER,
+                        TEST_PASSWORD,
+                        DEFAULT_DB,
                         "indexes",
                         "functional_unique_index",
                         parallelismSnapshot,
