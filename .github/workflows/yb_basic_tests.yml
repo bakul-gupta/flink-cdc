@@ -1,0 +1,195 @@
+# Standalone YB-focused basic test workflow for the Yugabyte Flink CDC fork.
+# Runs a Postgres-scoped build smoke job plus a curated slice of fast
+# Postgres-connector tests against `yugabytedb/yugabyte:latest` to validate
+# that recent changes have not broken the YB-relevant connectors. Triggered
+# manually from the Actions UI. It is intentionally NOT wired into the
+# release workflow; releases do not gate on it.
+#
+# Reactor scope is intentionally limited to the three Postgres connector
+# modules in YB_MODULES below. flink-cdc-dist is shipped by the release
+# workflow but excluded here because it is a packaging-only module with
+# no integration tests of its own.
+name: YB Basic Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Maven -Drevision value (e.g. 3.5.0-yb-2025.2-0-test)"
+        required: true
+        default: "3.5.0-yb-2025.2-0-test"
+        type: string
+
+env:
+  YB_MODULES: >-
+    flink-cdc-connect/flink-cdc-source-connectors/flink-connector-postgres-cdc,flink-cdc-connect/flink-cdc-source-connectors/flink-sql-connector-postgres-cdc,flink-cdc-connect/flink-cdc-pipeline-connectors/flink-cdc-pipeline-connector-postgres
+
+jobs:
+  build-smoke:
+    name: Postgres build smoke (mvn package -DskipTests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Set Maven 3.8.6
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: 3.8.6
+
+      - name: Build Postgres connectors with injected revision
+        env:
+          REVISION: ${{ inputs.revision }}
+          MODULES: ${{ env.YB_MODULES }}
+        run: |
+          set -euo pipefail
+          mvn --no-snapshot-updates -B -Drevision="${REVISION}" \
+              -pl "${MODULES}" -am -DskipTests package
+
+  yb-postgres-tests:
+    name: YB postgres connector basic tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Clean up disk space
+        run: |
+          set -euo pipefail
+          echo "Disk space before cleanup"
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          echo "Disk space after cleanup"
+          df -h
+
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Set Maven 3.8.6
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: 3.8.6
+
+      # Start YugabyteDB as a foreground-ish docker container. We can't
+      # easily use `services:` here because yugabyted needs a custom
+      # start command and a readiness probe on the ysql port (5433).
+      - name: Start YugabyteDB container
+        run: |
+          set -euo pipefail
+          docker run -d --name yb \
+            -p 5433:5433 -p 9042:9042 -p 15433:15433 -p 7000:7000 \
+            yugabytedb/yugabyte:latest \
+            bin/yugabyted start --background=false \
+              --master_flags="ysql_cdc_active_replication_slot_window_ms=0" \
+              --tserver_flags="ysql_cdc_active_replication_slot_window_ms=0"
+              
+      - name: Wait for YugabyteDB readiness
+        run: |
+          set -euo pipefail
+          last_host=""
+          last_status=""
+          for attempt in $(seq 1 90); do
+            status_output=$(docker exec yb bash -lc 'bin/yugabyted status' 2>/dev/null || true)
+            last_status="${status_output}"
+            yb_host=$(printf '%s\n' "${status_output}" \
+              | grep -oE 'ysqlsh -h [^ ]+' \
+              | awk '{print $3}' \
+              | head -n1)
+            if [ -n "${yb_host}" ]; then
+              last_host="${yb_host}"
+              if docker exec yb bin/ysqlsh -h "${yb_host}" -U yugabyte -d yugabyte -c 'SELECT 1;' >/dev/null 2>&1; then
+                echo "YugabyteDB is accepting SQL connections at ${yb_host}:5433 (attempt ${attempt})."
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+
+          echo "YugabyteDB did not become SQL-ready within 450s; dumping diagnostics:"
+          echo "Last advertised host: ${last_host:-<unknown>}"
+          echo "=== last observed yugabyted status ==="
+          printf '%s\n' "${last_status}"
+          echo "=== current yugabyted status ==="
+          docker exec yb bash -lc 'bin/yugabyted status || true' || true
+          echo "=== docker logs (tail 500) ==="
+          docker logs --tail 500 yb || true
+          exit 1
+
+      - name: Run basic YB-scoped tests
+        timeout-minutes: 30
+        env:
+          REVISION: ${{ inputs.revision }}
+          MODULES: ${{ env.YB_MODULES }}
+          BASIC_TESTS: >-
+            PostgresDialectTest,PostgreSQLTableFactoryTest,IncrementalSourceStreamFetcherTest,PostgresSourceFetchTaskContextTest
+        run: |
+          set -euo pipefail
+
+          mvn --no-snapshot-updates -B -Drevision="${REVISION}" \
+              -pl "${MODULES}" -am -DskipTests install
+
+          # Run ONLY the 4 named classes against the YB container at
+          # localhost:5433. Uses `mvn test` (not `verify`) so only the
+          # default-test surefire execution fires; the integration-tests
+          # execution bound to the integration-test phase would otherwise
+          # re-run every named class because -Dtest overrides per-execution
+          # <includes>. -DfailIfNoTests=false handles modules where none of
+          # the named classes exist (e.g. flink-sql-connector-postgres-cdc).
+          mvn --no-snapshot-updates -B -Drevision="${REVISION}" \
+              -pl "${MODULES}" \
+              -Dtest="${BASIC_TESTS}" \
+              -DfailIfNoTests=false \
+              test
+
+      - name: Dump YugabyteDB logs on failure
+        if: ${{ failure() }}
+        run: |
+          echo "=== docker ps ==="
+          docker ps -a || true
+          echo "=== yb logs (tail) ==="
+          docker logs --tail 500 yb || true
+
+      - name: Print JVM thread dumps on failure
+        if: ${{ failure() }}
+        run: |
+          set -euo pipefail
+          echo "$OSTYPE"
+          if [[ "$OSTYPE" == "linux-gnu"* ]] && command -v sudo &> /dev/null; then
+            curl -s -L -o /tmp/jattach https://github.com/apangin/jattach/releases/download/v2.1/jattach
+            if command -v sha256sum &> /dev/null; then
+              sha256sum -c <(echo "07885fdc782e02e7302c6d190f54c3930afa10a38140365adf54076ec1086a8e  /tmp/jattach") || exit 0
+            fi
+            chmod +x /tmp/jattach
+            for java_pid in $(sudo pgrep java || true); do
+              echo "----------------------- pid ${java_pid} -----------------------"
+              echo "command line: $(sudo cat "/proc/${java_pid}/cmdline" | xargs -0 echo)"
+              sudo /tmp/jattach "${java_pid}" jcmd VM.command_line || true
+              sudo /tmp/jattach "${java_pid}" jcmd "Thread.print -l" || true
+              sudo /tmp/jattach "${java_pid}" jcmd GC.heap_info || true
+            done
+          fi
+          exit 0
+
+      - name: Stop YugabyteDB container
+        if: always()
+        run: |
+          docker stop yb || true
+          docker rm yb || true

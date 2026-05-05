@@ -1,0 +1,497 @@
+# Release workflow for the Yugabyte Flink CDC fork.
+#
+# Two trigger surfaces:
+#   1. workflow_dispatch with mode=snapshot|release. Snapshot builds are
+#      intended for QA validation and do NOT push a git tag. Release builds
+#      push a permanent tag after a successful build + Docker push.
+#   2. Tag push matching fl.*.yb.*. Used for hotfix tags created out of band.
+#
+# The workflow always creates a DRAFT GitHub Release. A maintainer must
+# click "Publish release" in the GitHub UI to make it visible.
+name: YB Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "snapshot = build for QA validation; release = cut a GA draft"
+        type: choice
+        options:
+          - snapshot
+          - release
+        default: snapshot
+      flink_minor:
+        description: "Flink major.minor (e.g. 3.5)"
+        required: true
+        default: "3.5"
+      yb_version:
+        description: "YugabyteDB version segment (e.g. 2025.2)"
+        required: true
+        default: "2025.2"
+      patch:
+        description: "Patch number (e.g. 0)"
+        required: true
+        default: "0"
+      prerelease:
+        description: "Mark release as prerelease (snapshots are always prerelease regardless of this flag)"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'fl.*.yb.*'
+
+concurrency:
+  group: yb-release-${{ github.event.inputs.mode || 'release' }}-${{ github.event.inputs.flink_minor }}-${{ github.event.inputs.yb_version }}-${{ github.event.inputs.patch }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # Postgres-only release reactor. Leaf modules whose JARs we ship plus
+  # flink-cdc-dist. `-am` pulls in shared transitive deps (common/runtime/
+  # cli/composer/base/debezium); every other connector module is skipped.
+  YB_RELEASE_MODULES: >-
+    flink-cdc-connect/flink-cdc-source-connectors/flink-connector-postgres-cdc,flink-cdc-connect/flink-cdc-source-connectors/flink-sql-connector-postgres-cdc,flink-cdc-connect/flink-cdc-pipeline-connectors/flink-cdc-pipeline-connector-postgres,flink-cdc-dist
+
+jobs:
+  resolve-version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+      revision: ${{ steps.compute.outputs.revision }}
+      is_snapshot: ${{ steps.compute.outputs.is_snapshot }}
+      docker_tag: ${{ steps.compute.outputs.docker_tag }}
+    steps:
+      - name: Compute tag and revision
+        id: compute
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          MODE: ${{ github.event.inputs.mode }}
+          FLINK_MINOR: ${{ github.event.inputs.flink_minor }}
+          YB_VERSION: ${{ github.event.inputs.yb_version }}
+          PATCH: ${{ github.event.inputs.patch }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          if [ "${EVENT_NAME}" = "push" ]; then
+            # Tag-push trigger. Enforce strict regex on the pushed tag.
+            if [[ ! "${REF_NAME}" =~ ^fl\.([0-9]+\.[0-9]+)\.yb\.([0-9]+(\.[0-9]+)*)\.([0-9]+)$ ]]; then
+              echo "Pushed tag '${REF_NAME}' does not match required format: fl.<flink_minor>.yb.<yb_version>.<patch>" >&2
+              exit 1
+            fi
+            FLINK_MINOR="${BASH_REMATCH[1]}"
+            YB_VERSION="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[4]}"
+            TAG="${REF_NAME}"
+            REVISION="${FLINK_MINOR}.0-yb-${YB_VERSION}-${PATCH}"
+            IS_SNAPSHOT="false"
+          else
+            # workflow_dispatch. Validate inputs.
+            for var_name in FLINK_MINOR YB_VERSION PATCH; do
+              value="${!var_name}"
+              if [ -z "${value}" ]; then
+                echo "Missing required input: ${var_name}" >&2
+                exit 1
+              fi
+            done
+            if [[ ! "${FLINK_MINOR}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+              echo "flink_minor must match <major>.<minor>, got: ${FLINK_MINOR}" >&2
+              exit 1
+            fi
+            if [[ ! "${YB_VERSION}" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+              echo "yb_version must be dot-separated digits, got: ${YB_VERSION}" >&2
+              exit 1
+            fi
+            if [[ ! "${PATCH}" =~ ^[0-9]+$ ]]; then
+              echo "patch must be an integer, got: ${PATCH}" >&2
+              exit 1
+            fi
+
+            BASE_TAG="fl.${FLINK_MINOR}.yb.${YB_VERSION}.${PATCH}"
+            BASE_REV="${FLINK_MINOR}.0-yb-${YB_VERSION}-${PATCH}"
+            if [ "${MODE}" = "snapshot" ]; then
+              TAG="${BASE_TAG}-SNAPSHOT.${RUN_NUMBER}"
+              REVISION="${BASE_REV}-SNAPSHOT.${RUN_NUMBER}"
+              IS_SNAPSHOT="true"
+            else
+              TAG="${BASE_TAG}"
+              REVISION="${BASE_REV}"
+              IS_SNAPSHOT="false"
+            fi
+          fi
+
+          echo "Resolved tag:      ${TAG}"
+          echo "Resolved revision: ${REVISION}"
+          echo "Is snapshot:       ${IS_SNAPSHOT}"
+
+          {
+            echo "tag=${TAG}"
+            echo "revision=${REVISION}"
+            echo "is_snapshot=${IS_SNAPSHOT}"
+            echo "docker_tag=${TAG}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build-artifacts:
+    name: Build release artifacts
+    needs: [resolve-version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Set Maven 3.8.6
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: 3.8.6
+
+      - name: Build release artifacts
+        env:
+          REVISION: ${{ needs.resolve-version.outputs.revision }}
+          MODULES: ${{ env.YB_RELEASE_MODULES }}
+        run: |
+          set -euo pipefail
+          mvn --no-snapshot-updates -B -Drevision="${REVISION}" \
+              -pl "${MODULES}" -am -DskipTests package
+
+      - name: Stage release assets
+        env:
+          REVISION: ${{ needs.resolve-version.outputs.revision }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-staging
+
+          # Upstream poms mix ${project.version} and ${revision} for artifact
+          # finalName, plus child poms hardcode parent <version>3.5.0</version>,
+          # so `-Drevision=X` only propagates to artifacts whose name literally
+          # references ${revision}. Everywhere else produces the literal 3.5.0.
+          # Rather than guess which side each artifact falls on, locate each
+          # one by glob and restage it under the revision-suffixed name the
+          # rest of the pipeline (sanity check, Dockerfile, SHA256SUMS) expects.
+          stage_artifact() {
+            # Usage: stage_artifact <source_dir> <glob> <staged_name>
+            local src_dir="$1"
+            local glob="$2"
+            local dest_name="$3"
+
+            local matches=()
+            if [ -d "${src_dir}" ]; then
+              mapfile -t matches < <(find "${src_dir}" -maxdepth 1 -type f -name "${glob}")
+            fi
+
+            local keep=()
+            for f in "${matches[@]}"; do
+              local base="${f##*/}"
+              case "${base}" in
+                *-sources.jar|*-javadoc.jar|*-tests.jar|original-*)
+                  continue
+                  ;;
+              esac
+              keep+=("$f")
+            done
+
+            if [ "${#keep[@]}" -ne 1 ]; then
+              echo "ERROR: expected exactly one '${glob}' in ${src_dir}/, found ${#keep[@]}:" >&2
+              printf '  %s\n' "${keep[@]}" >&2
+              echo "Directory listing for context:" >&2
+              ls -la "${src_dir}/" >&2 || true
+              exit 1
+            fi
+
+            echo "Staging ${keep[0]} -> release-staging/${dest_name}"
+            cp "${keep[0]}" "release-staging/${dest_name}"
+          }
+
+          # Distribution tarball (assembly finalName uses ${project.version}).
+          stage_artifact "flink-cdc-dist/target" \
+                         "flink-cdc-*-bin.tar.gz" \
+                         "flink-cdc-${REVISION}-bin.tar.gz"
+
+          # Source tarball at the current SHA.
+          git archive \
+            --format=tar.gz \
+            --prefix="flink-cdc-${REVISION}/" \
+            -o "release-staging/flink-cdc-${REVISION}-src.tar.gz" \
+            HEAD
+
+          # YB-relevant connector JARs (use default project.build.finalName).
+          stage_artifact "flink-cdc-connect/flink-cdc-pipeline-connectors/flink-cdc-pipeline-connector-postgres/target" \
+                         "flink-cdc-pipeline-connector-postgres-*.jar" \
+                         "flink-cdc-pipeline-connector-postgres-${REVISION}.jar"
+
+          stage_artifact "flink-cdc-connect/flink-cdc-source-connectors/flink-sql-connector-postgres-cdc/target" \
+                         "flink-sql-connector-postgres-cdc-*.jar" \
+                         "flink-sql-connector-postgres-cdc-${REVISION}.jar"
+
+          stage_artifact "flink-cdc-connect/flink-cdc-source-connectors/flink-connector-postgres-cdc/target" \
+                         "flink-connector-postgres-cdc-*.jar" \
+                         "flink-connector-postgres-cdc-${REVISION}.jar"
+
+          # flink-cdc-dist jar: shade's custom finalName resolves to
+          # flink-cdc-dist-${revision}, which differs from the default compile
+          # jar name flink-cdc-dist-${project.version}=flink-cdc-dist-3.5.0.
+          # Because the names differ, shade does NOT replace the compile jar
+          # in place, so target/ contains both the small thin compile jar
+          # AND the ~36 MB shaded uber-jar. A `flink-cdc-dist-*.jar` glob
+          # matches both. Pin to the exact revision-suffixed filename (the
+          # shaded one we actually want) to disambiguate deterministically.
+          stage_artifact "flink-cdc-dist/target" \
+                         "flink-cdc-dist-${REVISION}.jar" \
+                         "flink-cdc-dist-${REVISION}.jar"
+
+          # Checksums.
+          (cd release-staging && sha256sum -- * > SHA256SUMS)
+
+          echo "Staged assets:"
+          ls -la release-staging
+          echo "---"
+          cat release-staging/SHA256SUMS
+
+      - name: Tarball sanity check
+        env:
+          REVISION: ${{ needs.resolve-version.outputs.revision }}
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d)"
+          tar -xzf "release-staging/flink-cdc-${REVISION}-bin.tar.gz" -C "${scratch}"
+          root="${scratch}/flink-cdc-${REVISION}"
+          echo "Verifying unpacked layout at ${root}"
+          test -d "${root}/bin"  || { echo "bin/ missing"  >&2; exit 1; }
+          test -d "${root}/conf" || { echo "conf/ missing" >&2; exit 1; }
+          test -d "${root}/lib"  || { echo "lib/ missing"  >&2; exit 1; }
+          test -f "${root}/bin/flink-cdc.sh" || { echo "bin/flink-cdc.sh missing" >&2; exit 1; }
+          test -f "${root}/lib/flink-cdc-dist-${REVISION}.jar" || { echo "lib/flink-cdc-dist jar missing" >&2; exit 1; }
+          echo "Tarball sanity check passed."
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.resolve-version.outputs.tag }}
+          path: release-staging/
+          if-no-files-found: error
+          retention-days: 14
+
+  push-docker:
+    name: Push Docker image to Quay
+    needs: [resolve-version, build-artifacts]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Download release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.resolve-version.outputs.tag }}
+          path: release-staging
+
+      - name: Log in to quay.io
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_ROBOT_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        id: docker_build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: release/Dockerfile.release
+          build-args: |
+            FLINK_CDC_VERSION=${{ needs.resolve-version.outputs.revision }}
+          tags: quay.io/yugabyte/ybdb-flink-cdc:${{ needs.resolve-version.outputs.docker_tag }}
+          push: true
+          provenance: true
+
+      - name: Record image ref for release body
+        env:
+          TAG: ${{ needs.resolve-version.outputs.docker_tag }}
+          DIGEST: ${{ steps.docker_build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p docker-meta
+          IMAGE_REF="quay.io/yugabyte/ybdb-flink-cdc:${TAG}"
+          if [ -n "${DIGEST}" ]; then
+            IMAGE_REF_PINNED="quay.io/yugabyte/ybdb-flink-cdc@${DIGEST}"
+          else
+            IMAGE_REF_PINNED="${IMAGE_REF}"
+          fi
+          printf '%s\n' "${IMAGE_REF}"        >  docker-meta/image_ref.txt
+          printf '%s\n' "${IMAGE_REF_PINNED}" >  docker-meta/image_ref_pinned.txt
+
+          {
+            echo "### Docker image"
+            echo ""
+            echo "\`\`\`"
+            echo "docker pull ${IMAGE_REF}"
+            echo "\`\`\`"
+            echo ""
+            echo "Digest-pinned: \`${IMAGE_REF_PINNED}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload docker image metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-meta-${{ needs.resolve-version.outputs.tag }}
+          path: docker-meta/
+          if-no-files-found: error
+          retention-days: 14
+
+  tag-and-publish:
+    name: Tag and publish draft release
+    needs: [resolve-version, build-artifacts, push-docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.resolve-version.outputs.tag }}
+          path: release-staging
+
+      - name: Download docker metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-meta-${{ needs.resolve-version.outputs.tag }}
+          path: docker-meta
+
+      - name: Push git tag (release mode only)
+        if: ${{ github.event_name == 'workflow_dispatch' && needs.resolve-version.outputs.is_snapshot == 'false' }}
+        env:
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists locally; skipping creation."
+          else
+            git tag -a "${TAG}" -m "Release ${TAG}" "${GITHUB_SHA}"
+            git push origin "refs/tags/${TAG}"
+            echo "Pushed tag ${TAG}."
+          fi
+
+      - name: Compose release body
+        id: body
+        env:
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+          REVISION: ${{ needs.resolve-version.outputs.revision }}
+          IS_SNAPSHOT: ${{ needs.resolve-version.outputs.is_snapshot }}
+          FLINK_MINOR: ${{ github.event.inputs.flink_minor }}
+          YB_VERSION: ${{ github.event.inputs.yb_version }}
+          PATCH: ${{ github.event.inputs.patch }}
+        run: |
+          set -euo pipefail
+          mode_label="Release"
+          if [ "${IS_SNAPSHOT}" = "true" ]; then
+            mode_label="Snapshot (QA build)"
+          fi
+
+          image_ref="$(cat docker-meta/image_ref.txt)"
+          image_ref_pinned="$(cat docker-meta/image_ref_pinned.txt)"
+
+          {
+            echo "## ${mode_label}: \`${TAG}\`"
+            echo ""
+            echo "- Maven revision: \`${REVISION}\`"
+            if [ -n "${FLINK_MINOR}" ]; then
+              echo "- Flink minor: \`${FLINK_MINOR}\`"
+            fi
+            if [ -n "${YB_VERSION}" ]; then
+              echo "- YugabyteDB version: \`${YB_VERSION}\`"
+            fi
+            if [ -n "${PATCH}" ]; then
+              echo "- Patch: \`${PATCH}\`"
+            fi
+            echo ""
+            echo "### Docker image"
+            echo ""
+            echo '```'
+            echo "docker pull ${image_ref}"
+            echo '```'
+            echo ""
+            echo "Digest-pinned: \`${image_ref_pinned}\`"
+            echo ""
+            echo "### SHA256 checksums"
+            echo ""
+            echo '```'
+            cat release-staging/SHA256SUMS
+            echo '```'
+          } > release_body.md
+
+          echo "body_path=$(pwd)/release_body.md" >> "${GITHUB_OUTPUT}"
+
+      - name: Compute prerelease flag
+        id: prerelease
+        env:
+          IS_SNAPSHOT: ${{ needs.resolve-version.outputs.is_snapshot }}
+          INPUT_PRERELEASE: ${{ github.event.inputs.prerelease }}
+        run: |
+          if [ "${IS_SNAPSHOT}" = "true" ] || [ "${INPUT_PRERELEASE}" = "true" ]; then
+            echo "value=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "value=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Create DRAFT GitHub Release
+        id: gh_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve-version.outputs.tag }}
+          name: ${{ needs.resolve-version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: true
+          prerelease: ${{ steps.prerelease.outputs.value }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body_path: ${{ steps.body.outputs.body_path }}
+          files: |
+            release-staging/*
+
+      - name: Job summary
+        env:
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+          IS_SNAPSHOT: ${{ needs.resolve-version.outputs.is_snapshot }}
+          DRAFT_URL: ${{ steps.gh_release.outputs.url }}
+        run: |
+          {
+            echo "## Draft release created"
+            echo ""
+            echo "- Tag: \`${TAG}\`"
+            echo "- Draft URL: ${DRAFT_URL}"
+            echo ""
+            echo "### Next steps"
+            echo ""
+            echo "1. Review the auto-generated release notes and attached assets."
+            echo "2. Verify the Docker image on \`quay.io/yugabyte/ybdb-flink-cdc\`."
+            if [ "${IS_SNAPSHOT}" = "true" ]; then
+              echo "3. Click **Publish release** (stays flagged as pre-release) and share the link with QA."
+            else
+              echo "3. Click **Publish release** to make the GA release public."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

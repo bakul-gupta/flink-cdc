@@ -1,0 +1,87 @@
+#/*
+# * Licensed to the Apache Software Foundation (ASF) under one or more
+# * contributor license agreements.  See the NOTICE file distributed with
+# * this work for additional information regarding copyright ownership.
+# * The ASF licenses this file to You under the Apache License, Version 2.0
+# * (the "License"); you may not use this file except in compliance with
+# * the License.  You may obtain a copy of the License at
+# *
+# *      http://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# */
+
+# -----------------------------------------------------------------------------
+# Release-time distribution image for the Yugabyte Flink CDC fork.
+# Unlike the developer Dockerfile at the repo root (which bakes in a user
+# pipeline definition), this image ships the Flink CDC runtime plus all
+# three YB-relevant Postgres connectors so a single image can serve Flink
+# CDC Pipeline (YAML), Flink SQL, and Flink DataStream jobs without the
+# caller having to mount extra jars.
+#
+# Build context is expected to contain:
+#   release-staging/flink-cdc-${FLINK_CDC_VERSION}-bin.tar.gz
+#   release-staging/flink-cdc-pipeline-connector-postgres-${FLINK_CDC_VERSION}.jar
+#   release-staging/flink-sql-connector-postgres-cdc-${FLINK_CDC_VERSION}.jar
+#   release-staging/flink-connector-postgres-cdc-${FLINK_CDC_VERSION}.jar
+#
+# The release workflow stages these into ./release-staging/ before invoking
+# docker build, so COPY paths below are relative to that directory.
+# -----------------------------------------------------------------------------
+
+ARG FLINK_BASE_IMAGE=flink:1.20.1-scala_2.12-java8
+FROM ${FLINK_BASE_IMAGE}
+
+ARG FLINK_CDC_VERSION
+
+ENV FLINK_CDC_HOME=/opt/flink-cdc
+
+RUN mkdir -p /opt/flink-cdc /opt/flink/usrlib
+
+COPY release-staging/flink-cdc-${FLINK_CDC_VERSION}-bin.tar.gz /tmp/flink-cdc-bin.tar.gz
+
+RUN tar -xzvf /tmp/flink-cdc-bin.tar.gz -C /tmp/ \
+ && mv /tmp/flink-cdc-${FLINK_CDC_VERSION}/* /opt/flink-cdc/ \
+ && mv /opt/flink-cdc/lib/flink-cdc-dist-${FLINK_CDC_VERSION}.jar /opt/flink-cdc/lib/flink-cdc-dist.jar \
+ && rm -rf /tmp/flink-cdc-${FLINK_CDC_VERSION} /tmp/flink-cdc-bin.tar.gz
+
+# Flink CDC Pipeline connector (used by /opt/flink-cdc/bin/flink-cdc.sh when
+# submitting YAML pipelines). /opt/flink/usrlib/ is Flink's convention for
+# per-job user libraries and is picked up automatically at submission time.
+COPY release-staging/flink-cdc-pipeline-connector-postgres-${FLINK_CDC_VERSION}.jar /opt/flink/usrlib/flink-cdc-pipeline-connector-postgres-${FLINK_CDC_VERSION}.jar
+
+# Flink SQL connector (shaded uber-jar). Provides the 'postgres-cdc'
+# DynamicTableFactory; Flink SQL resolves factories only from the main
+# classpath, so this must live under /opt/flink/lib/.
+COPY release-staging/flink-sql-connector-postgres-cdc-${FLINK_CDC_VERSION}.jar /opt/flink/lib/flink-sql-connector-postgres-cdc-${FLINK_CDC_VERSION}.jar
+
+# Flink DataStream connector (thin, non-shaded). Shipped in /opt/flink/opt/
+# rather than /opt/flink/lib/ on purpose:
+#   * /opt/flink/opt/ is Flink's convention for optional libraries and is
+#     NOT on the runtime classpath by default.
+#   * Putting this jar on the main classpath alongside the shaded SQL
+#     connector causes a hard class conflict: both jars contain the same
+#     connector classes, but the thin jar references un-relocated Jackson
+#     (com.fasterxml.jackson.*) which Flink does not ship, while the
+#     shaded jar references the relocated path. If the thin class wins
+#     the classloader race, Flink SQL throws NoClassDefFoundError for
+#     com.fasterxml.jackson.databind.ObjectMapper.
+# DataStream-API users should either depend on flink-connector-postgres-cdc
+# in their own POM, or copy this jar into their application fat jar.
+COPY release-staging/flink-connector-postgres-cdc-${FLINK_CDC_VERSION}.jar /opt/flink/opt/flink-connector-postgres-cdc-${FLINK_CDC_VERSION}.jar
+
+# Additional runtime JARs used by the Postgres pipelines: Flink's JDBC sink
+# connector and the PostgreSQL JDBC driver. Placed on the main classpath.
+RUN wget -P /opt/flink/lib/ https://repo.maven.apache.org/maven2/org/apache/flink/flink-connector-jdbc/3.3.0-1.20/flink-connector-jdbc-3.3.0-1.20.jar
+RUN wget -P /opt/flink/lib/ https://repo.maven.apache.org/maven2/org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar
+
+# Labels for traceability on quay.io.
+LABEL org.opencontainers.image.source="https://github.com/yugabyte/flink-cdc" \
+      org.opencontainers.image.title="Flink CDC (Yugabyte distribution)" \
+      org.opencontainers.image.description="Flink CDC distribution produced by the Yugabyte fork. Includes the Flink CDC Pipeline runtime plus all three YB-compatible Postgres connectors (Pipeline, Flink SQL, DataStream)." \
+      org.opencontainers.image.version="${FLINK_CDC_VERSION}" \
+      org.opencontainers.image.licenses="Apache-2.0"
