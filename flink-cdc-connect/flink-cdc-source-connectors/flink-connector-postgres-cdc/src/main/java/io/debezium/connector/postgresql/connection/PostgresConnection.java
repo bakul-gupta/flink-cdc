@@ -329,17 +329,7 @@ public class PostgresConnection extends JdbcConnection {
                                     return null;
                                 }
                                 final Long xmin = rs.getLong("catalog_xmin");
-                                Long restartCommitHT = null;
-                                try {
-                                    restartCommitHT = rs.getLong("yb_restart_commit_ht");
-                                    if (rs.wasNull()) {
-                                        restartCommitHT = null;
-                                    }
-                                } catch (SQLException e) {
-                                    LOGGER.debug(
-                                            "yb_restart_commit_ht column not available: {}",
-                                            e.getMessage());
-                                }
+                                final Long restartCommitHT = rs.getLong("yb_restart_commit_ht");
                                 return new ServerInfo.ReplicationSlot(
                                         active,
                                         confirmedFlushedLsn,
