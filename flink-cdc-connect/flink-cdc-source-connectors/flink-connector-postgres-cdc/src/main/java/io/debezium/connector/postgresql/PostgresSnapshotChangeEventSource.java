@@ -326,22 +326,7 @@ public class PostgresSnapshotChangeEventSource
         String transactionStatement =
                 snapshotter.snapshotTransactionIsolationLevelStatement(slotCreatedInfo);
         LOGGER.info("Opening transaction with statement {}", transactionStatement);
-        // SET TRANSACTION SNAPSHOT is not supported in a batch on YB, so execute each
-        // statement individually when the transaction statement contains multiple parts.
-        // Dollar-quoted blocks (DO $$ ... $$) must not be split on internal semicolons.
-        if (transactionStatement.contains("$$")) {
-            LOGGER.info("Executing transaction statement: {}", transactionStatement);
-            jdbcConnection.executeWithoutCommitting(transactionStatement);
-        } else {
-            String[] statements = transactionStatement.split(";");
-            for (String stmt : statements) {
-                String trimmed = stmt.trim();
-                if (!trimmed.isEmpty()) {
-                    LOGGER.info("Executing transaction statement: {}", trimmed);
-                    jdbcConnection.executeWithoutCommitting(trimmed);
-                }
-            }
-        }
+        jdbcConnection.executeWithoutCommitting(transactionStatement);
 
         if (YugabyteDBServer.isEnabled()
                 && slotCreatedInfo != null

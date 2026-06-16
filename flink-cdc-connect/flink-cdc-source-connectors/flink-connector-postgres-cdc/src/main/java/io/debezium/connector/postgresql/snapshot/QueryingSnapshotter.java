@@ -86,14 +86,10 @@ public abstract class QueryingSnapshotter implements Snapshotter {
 
     private String ybSnapshotStatement(String ybReadTime) {
         return String.format(
-                "DO "
-                        + "LANGUAGE plpgsql $$ "
-                        + "BEGIN "
-                        + "SET LOCAL yb_read_time TO '%s ht'; "
-                        + "EXCEPTION "
-                        + "WHEN OTHERS THEN "
-                        + "CALL set_yb_read_time('%s ht'); "
+                "DO LANGUAGE plpgsql $$ "
+                        + "BEGIN SET LOCAL yb_read_time TO '%1$s ht'; "
+                        + "EXCEPTION WHEN OTHERS THEN CALL set_yb_read_time('%1$s ht'); "
                         + "END $$;",
-                ybReadTime, ybReadTime);
+                ybReadTime);
     }
 }
